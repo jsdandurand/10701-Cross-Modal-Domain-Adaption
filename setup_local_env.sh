@@ -20,9 +20,9 @@ conda activate $ENV_NAME
 
 # ============ 3. Install PyTorch (CPU or GPU version) ============
 
-# conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
-echo ">>> Installing PyTorch (CPU version)..."
-conda install -y pytorch torchvision torchaudio cpuonly -c pytorch
+echo ">>> Installing PyTorch (GPU version with CUDA 12.2)..."
+conda install -y pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+#conda install -y pytorch torchvision torchaudio cpuonly -c pytorch
 
 # ============ 4. Install requirements ============
 echo ">>> Installing project dependencies..."
@@ -32,7 +32,7 @@ pip install numpy==1.26.4
 pip install scikit-learn==1.5.0
 pip install matplotlib==3.8.4
 pip install mlflow==2.14.3
-pip install tqdm==4.66.2
+pip install tqdm==4.66.3
 
 # ============ 5. Initialize MLflow ============
 echo ">>> Setting up local MLflow tracking directory..."
