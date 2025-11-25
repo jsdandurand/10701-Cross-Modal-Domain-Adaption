@@ -1,32 +1,49 @@
 """
 train_baseline.py
-Baseline implementation for Cross-Modal TinyLlama (Stage 1)
+Baseline implementation for Cross-Modal GPT-2 (Stage 1)
 """
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from transformers import AutoModel, AutoTokenizer, AutoConfig
+from transformers import AutoModel, AutoConfig, AutoTokenizer
 import mlflow
 import os
+import argparse
 from tqdm import tqdm
 
 # ===================== Config =====================
-MODEL_NAME = "nickypro/tinyllama-110M"
-BATCH_SIZE = 16
-EPOCHS = 20
-LR = 1e-4
-PATCH_SIZE = 4  # (32/4 = 8) yielding patch number 8x8 = 64 
-EMBED_DIM = AutoConfig.from_pretrained(MODEL_NAME).hidden_size # 768
+# Model selection: "gpt2" (117M) or "nickypro/tinyllama-110M" (~110M)
+MODEL_NAME = "nickypro/tinyllama-110M"  # Options: "gpt2" or "nickypro/tinyllama-110M"
+BATCH_SIZE = 64
+EPOCHS = 50
+LR = 1e-3  # Lower learning rate for better convergence
+PATCH_SIZE = 4  # (32/4 = 8) yielding patch number 8x8 = 64
+EMBED_DIM = AutoConfig.from_pretrained(MODEL_NAME).hidden_size  # Automatically determined from model
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 NUM_CLASSES = 10
+CLASSIFIER_DROPOUT = 0.1  # Dropout rate for classification head
 
 # ===================== Data Pipeline =====================
-transform = transforms.Compose([transforms.ToTensor(),])
+# Data augmentation for training
+train_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomRotation(20),
+    #transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+])
 
-trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-testset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+# No augmentation for testing
+test_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+])
+
+trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=train_transform)
+testset = datasets.CIFAR10(root="./data", train=False, download=True, transform=test_transform)
 train_loader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False)
 
@@ -45,28 +62,71 @@ class ImageTokenizer(nn.Module):
         return self.proj(patches)  # [B, num_patches, embed_dim]
 
 
+# ======================== Classification Head ========================
+class ClassificationHead(nn.Module):
+    def __init__(self, embed_dim, num_classes, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        # Simple linear classifier (as used in the paper)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+    
+    def forward(self, x):
+        x = self.dropout(x)
+        return self.classifier(x)
+
+
 # ======================== Model ========================
-class CrossModalTinyLlama(nn.Module):
-    def __init__(self, base_model_name=MODEL_NAME, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES):
+class CrossModalGPT2(nn.Module):
+    def __init__(self, base_model_name=MODEL_NAME, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES, 
+                 pretrained_tokenizer_path=None, in_channels=3):
         super().__init__()
         self.llm = AutoModel.from_pretrained(base_model_name)
         for param in self.llm.parameters():
             param.requires_grad = False  # frozen backbone
 
+        # Unfreeze layer norm parameters (affine scale and bias)
+        # GPT-2 has 2 layer norms per block (ln_1 before attention, ln_2 before feedforward)
+        # Each has weight (scale) and bias parameters: 4 × ndim × nlayers = 4 × 768 × 12 = 36,864 params
         for name, param in self.llm.named_parameters():
             if "norm" in name.lower():
                 param.requires_grad = True # unfreeze layer norm 
 
         # Patch Embedding
-        self.tokenizer = ImageTokenizer(embed_dim=embed_dim)
+        self.tokenizer = ImageTokenizer(embed_dim=embed_dim, in_channels=in_channels)
 
         # Learnable positional embedding
         self.num_patches = (32 // 4) ** 2  # CIFAR-10: 32x32 image, patch=4 -> 8x8=64 patches
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # Load pretrained tokenizer from stage2 if provided
+        if pretrained_tokenizer_path is not None and os.path.exists(pretrained_tokenizer_path):
+            print(f"Loading pretrained tokenizer from {pretrained_tokenizer_path}")
+            checkpoint = torch.load(pretrained_tokenizer_path, map_location=DEVICE)
+            
+            # Load image tokenizer state dict
+            if "image_tokenizer" in checkpoint:
+                self.tokenizer.load_state_dict(checkpoint["image_tokenizer"])
+                # Ensure loaded parameters are trainable
+                for param in self.tokenizer.parameters():
+                    param.requires_grad = True
+                print("Loaded pretrained image tokenizer (trainable)")
+            else:
+                print("Warning: 'image_tokenizer' not found in checkpoint, using random initialization")
+            
+            # Load positional embedding
+            if "pos_embed" in checkpoint:
+                self.pos_embed.data = checkpoint["pos_embed"].data
+                # Ensure loaded positional embedding is trainable
+                self.pos_embed.requires_grad = True
+                print("Loaded pretrained positional embedding (trainable)")
+            else:
+                print("Warning: 'pos_embed' not found in checkpoint, using random initialization")
+        elif pretrained_tokenizer_path is not None:
+            print(f"Warning: Pretrained tokenizer path {pretrained_tokenizer_path} does not exist, using random initialization")
 
         # Classification head
-        self.cls_head = nn.Linear(embed_dim, num_classes)
+        self.cls_head = ClassificationHead(embed_dim, num_classes, dropout=CLASSIFIER_DROPOUT)
 
         # Parameters finetuned: 
         # 1) input embedding, 
@@ -79,8 +139,11 @@ class CrossModalTinyLlama(nn.Module):
         tokens = tokens + self.pos_embed
 
         outputs = self.llm(inputs_embeds=tokens)
-        last_hidden = outputs.last_hidden_state.mean(dim=1)
-        return self.cls_head(last_hidden)
+        
+        # Use mean pooling over all tokens instead of last token
+        # Shape: [B, num_patches, embed_dim] -> [B, embed_dim]
+        pooled_hidden = outputs.last_hidden_state.mean(dim=1)  # Mean pooling
+        return self.cls_head(pooled_hidden)
 
 
 # ===================== Training Loop =====================
@@ -124,11 +187,34 @@ def evaluate(model, dataloader, criterion):
 
 # ===================== Main =====================
 def main():
-    mlflow.set_tracking_uri("file:./mlruns")
-    mlflow.set_experiment("CrossModal_TinyLlama_Baseline")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path to pretrained tokenizer from stage2')
+    args = parser.parse_args()
 
-    model = CrossModalTinyLlama().to(DEVICE)
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    print(f"Using model: {MODEL_NAME}")
+    print(f"Embedding dimension: {EMBED_DIM}")
+    print(f"Pretrained tokenizer: {args.pretrained}")
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    # Set experiment name based on model
+    model_short_name = MODEL_NAME.split("/")[-1].split("-")[0] if "/" in MODEL_NAME else MODEL_NAME
+    exp_suffix = "_WithAlign" if args.pretrained else "_Baseline"
+    mlflow.set_experiment(f"CrossModal_{model_short_name}{exp_suffix}")
+
+    # Determine input channels (default to 3 for RGB)
+    # Check if USE_GRAYSCALE flag exists in globals
+    use_grayscale = globals().get('USE_GRAYSCALE', False)
+    in_channels = 1 if use_grayscale else 3
+
+    # Initialize model with optional pretrained tokenizer
+    model = CrossModalGPT2(
+        pretrained_tokenizer_path=args.pretrained,
+        in_channels=in_channels
+    ).to(DEVICE)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-4)
+    # Add learning rate scheduler for better convergence
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     criterion = nn.CrossEntropyLoss()
     
     print("====== Trainable Parameters =======")
@@ -149,6 +235,8 @@ def main():
             ckpt = torch.load(latest_ckpt, map_location=DEVICE)
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "scheduler_state" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
             start_epoch = ckpt["epoch"] + 1
             print(f"Resumed at epoch {start_epoch}")
 
@@ -165,11 +253,17 @@ def main():
             mlflow.log_metric("test_acc", test_acc, step=epoch)
             print(f"[Epoch {epoch+1}] Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}")
 
+            # ---------- Update learning rate ----------
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            mlflow.log_metric("learning_rate", current_lr, step=epoch)
+
             # ---------- Save checkpoint ----------
             ckpt = {
                 "epoch": epoch,
                 "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict()
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict()
             }
             torch.save(ckpt, latest_ckpt)
 

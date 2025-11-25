@@ -39,10 +39,26 @@ echo "Environment setup complete."
 echo "=========================================="
 
 # ============================================
-# RUN THE TRAINING SCRIPT
+# RUN THE 3-STAGE PIPELINE
 # ============================================
-echo "Starting training..."
+
+# Stage 1: Baseline (no pretrained tokenizer)
+echo "Stage 1: Training baseline..."
 python -u train_tinyllama.py
+echo "Stage 1 complete."
+echo "=========================================="
+
+# Stage 2: Embedding Alignment
+echo "Stage 2: Training embedding alignment..."
+python -u train_stage2_align.py --distance mmd
+echo "Stage 2 complete."
+echo "=========================================="
+
+# Stage 3: With aligned tokenizer
+echo "Stage 3: Training with aligned tokenizer..."
+rm -f latest_checkpoint.pt
+python -u train_tinyllama.py --pretrained stage2_align_mse_model.pt
+echo "Stage 3 complete."
 echo "=========================================="
 
 echo "Job finished at $(date)"
