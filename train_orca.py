@@ -1,0 +1,505 @@
+"""
+Unified ORCA Training Script
+
+This script combines embedding alignment and task training into a single workflow.
+Supports:
+- Optional embedding alignment (Stage 2)
+- Task training (Stage 3)
+- Loading hyperparameters from JSON
+- FPT and full fine-tuning modes
+- Everything kept in memory (no intermediate saves)
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from transformers import AutoModel, AutoConfig, AutoTokenizer
+import mlflow
+import os
+import argparse
+import json
+from tqdm import tqdm
+from typing import Dict, Optional, Tuple
+import numpy as np
+
+# ===================== Config =====================
+MODEL_NAME = "nickypro/tinyllama-110M"
+PATCH_SIZE = 4
+EMBED_DIM = AutoConfig.from_pretrained(MODEL_NAME).hidden_size
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+NUM_CLASSES = 10
+NUM_SAMPLES_ALIGNMENT = 50000  # Number of text samples for alignment
+
+# ===================== Model Components =====================
+class ImageTokenizer(nn.Module):
+    def __init__(self, patch_size=PATCH_SIZE, in_channels=3, embed_dim=EMBED_DIM):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Linear(in_channels * patch_size * patch_size, embed_dim)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        patches = patches.contiguous().view(B, C, -1, self.patch_size * self.patch_size)
+        patches = patches.permute(0, 2, 1, 3).reshape(B, -1, C * self.patch_size * self.patch_size)
+        return self.proj(patches)
+
+
+class ClassificationHead(nn.Module):
+    def __init__(self, embed_dim, num_classes, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+    
+    def forward(self, x):
+        x = self.dropout(x)
+        return self.classifier(x)
+
+
+class CrossModalModel(nn.Module):
+    def __init__(self, base_model_name=MODEL_NAME, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES, 
+                 in_channels=3, full_finetune=False):
+        super().__init__()
+        self.llm = AutoModel.from_pretrained(base_model_name)
+        
+        if full_finetune:
+            for param in self.llm.parameters():
+                param.requires_grad = True
+        else:
+            for param in self.llm.parameters():
+                param.requires_grad = False
+            for name, param in self.llm.named_parameters():
+                if "norm" in name.lower():
+                    param.requires_grad = True
+
+        self.tokenizer = ImageTokenizer(embed_dim=embed_dim, in_channels=in_channels)
+        self.num_patches = (32 // PATCH_SIZE) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.cls_head = ClassificationHead(embed_dim, num_classes, dropout=0.1)
+
+    def forward(self, x):
+        tokens = self.tokenizer(x)
+        tokens = tokens + self.pos_embed
+        outputs = self.llm(inputs_embeds=tokens)
+        pooled_hidden = outputs.last_hidden_state.mean(dim=1)
+        return self.cls_head(pooled_hidden)
+
+
+# ===================== Distance Metrics for Alignment =====================
+class MSEDistance(nn.Module):
+    def forward(self, x, y):
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+        if y.dim() == 3:
+            y = y.mean(dim=1)
+        return F.mse_loss(x, y)
+
+
+class CosineDistance(nn.Module):
+    def forward(self, x, y):
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+        if y.dim() == 3:
+            y = y.mean(dim=1)
+        x_norm = F.normalize(x, p=2, dim=1)
+        y_norm = F.normalize(y, p=2, dim=1)
+        cosine_sim = (x_norm * y_norm).sum(dim=1).mean()
+        return 1 - cosine_sim
+
+
+class MMDDistance(nn.Module):
+    def __init__(self, kernel_mul=2.0, kernel_num=5):
+        super().__init__()
+        self.kernel_mul = kernel_mul
+        self.kernel_num = kernel_num
+    
+    def gaussian_kernel(self, source, target):
+        n_samples = int(source.size()[0]) + int(target.size()[0])
+        total = torch.cat([source, target], dim=0)
+        total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        L2_distance = ((total0 - total1) ** 2).sum(2)
+        bandwidth = torch.sum(L2_distance.data) / (n_samples ** 2 - n_samples)
+        bandwidth /= self.kernel_mul ** (self.kernel_num // 2)
+        bandwidth_list = [bandwidth * (self.kernel_mul ** i) for i in range(self.kernel_num)]
+        kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
+        return sum(kernel_val)
+    
+    def forward(self, x, y):
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+        if y.dim() == 3:
+            y = y.mean(dim=1)
+        xx = self.gaussian_kernel(x, x)
+        yy = self.gaussian_kernel(y, y)
+        xy = self.gaussian_kernel(x, y)
+        return xx.mean() + yy.mean() - 2 * xy.mean()
+
+
+# ===================== Helper Functions =====================
+def sample_text_embeddings(llm_model, num_samples=NUM_SAMPLES_ALIGNMENT, device=DEVICE):
+    """Sample text embeddings from LLM for alignment"""
+    llm_model.eval()
+    embed_layer = llm_model.get_input_embeddings()
+    vocab_size = embed_layer.weight.size(0)
+    
+    with torch.no_grad():
+        token_ids = torch.randint(0, vocab_size, (num_samples, 64), device=device)
+        token_embeds = embed_layer(token_ids)
+    
+    return token_embeds
+
+
+def train_alignment_epoch(model, image_loader, target_embeddings, optimizer, distance_metric, device=DEVICE):
+    """Train one epoch for embedding alignment"""
+    model.train()
+    total_loss = 0
+    num_batches = 0
+    
+    for images, _ in image_loader:
+        images = images.to(device)
+        batch_size = images.size(0)
+        
+        indices = torch.randint(0, target_embeddings.size(0), (batch_size,), device=device)
+        target_embeds = target_embeddings[indices].to(device)
+        
+        optimizer.zero_grad()
+        image_embeds = model.tokenizer(images)
+        image_embeds = image_embeds + model.pos_embed
+        loss = distance_metric(image_embeds, target_embeds)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        num_batches += 1
+    
+    return total_loss / num_batches if num_batches > 0 else 0
+
+
+def train_task_epoch(model, dataloader, optimizer, criterion, device=DEVICE):
+    """Train one epoch for task loss"""
+    model.train()
+    total_loss, total_correct, total_samples = 0, 0, 0
+
+    for imgs, labels in tqdm(dataloader, desc="Training", leave=False):
+        imgs, labels = imgs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        logits = model(imgs)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * imgs.size(0)
+        total_correct += (logits.argmax(1) == labels).sum().item()
+        total_samples += imgs.size(0)
+
+    return total_loss / total_samples, total_correct / total_samples
+
+
+def evaluate(model, dataloader, criterion, device=DEVICE):
+    """Evaluate model on task"""
+    model.eval()
+    total_loss, total_correct, total_samples = 0, 0, 0
+
+    with torch.no_grad():
+        for imgs, labels in tqdm(dataloader, desc="Evaluating", leave=False):
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits = model(imgs)
+            loss = criterion(logits, labels)
+
+            total_loss += loss.item() * imgs.size(0)
+            total_correct += (logits.argmax(1) == labels).sum().item()
+            total_samples += imgs.size(0)
+
+    avg_loss = total_loss / total_samples
+    avg_acc = total_correct / total_samples
+    return avg_loss, avg_acc
+
+
+def load_hyperparameters(config_path: Optional[str]) -> Dict:
+    """Load hyperparameters from JSON file or return defaults"""
+    if config_path and os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        print(f"Loaded hyperparameters from {config_path}")
+        return config
+    else:
+        # Default hyperparameters
+        return {
+            'lr': 1e-3,
+            'batch_size': 64,
+            'weight_decay': 1e-4,
+            'optimizer': 'adamw',
+            'scheduler': 'cosine',
+            'dropout': 0.1,
+            'alignment_epochs': 20,
+            'alignment_lr': 1e-4,
+            'alignment_batch_size': 16,
+            'alignment_distance': 'mse',
+            'task_epochs': 50
+        }
+
+
+def create_optimizer(model, config: Dict):
+    """Create optimizer based on config"""
+    params = filter(lambda p: p.requires_grad, model.parameters())
+    if config['optimizer'] == 'adam':
+        return torch.optim.Adam(params, lr=config['lr'], weight_decay=config['weight_decay'])
+    else:  # adamw
+        return torch.optim.AdamW(params, lr=config['lr'], weight_decay=config['weight_decay'])
+
+
+def create_scheduler(optimizer, config: Dict, num_epochs: int):
+    """Create learning rate scheduler based on config"""
+    if config['scheduler'] == 'cosine':
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    elif config['scheduler'] == 'linear':
+        return torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=num_epochs)
+    else:
+        return None
+
+
+# ===================== Main Training Function =====================
+def train_orca(
+    do_alignment: bool = False,
+    full_finetune: bool = False,
+    config_path: Optional[str] = None,
+    val_loader: Optional[DataLoader] = None,
+    return_val_acc: bool = False,
+    val_split: float = 0.0
+) -> Tuple[float, Optional[float]]:
+    """
+    Main training function for ORCA workflow
+    
+    Args:
+        do_alignment: Whether to perform embedding alignment
+        full_finetune: Whether to use full fine-tuning (vs FPT)
+        config_path: Path to JSON file with hyperparameters
+        val_loader: Validation loader (for hyperparameter tuning)
+        return_val_acc: Whether to return validation accuracy
+        val_split: Validation split ratio (if val_loader not provided)
+    
+    Returns:
+        Final test/val accuracy, and optionally validation accuracy
+    """
+    # Load hyperparameters
+    config = load_hyperparameters(config_path)
+    
+    # Data loading
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomRotation(20),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+    
+    # Handle validation split
+    if val_loader is None and val_split > 0:
+        from torch.utils.data import Subset
+        full_trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=train_transform)
+        dataset_size = len(full_trainset)
+        indices = list(range(dataset_size))
+        np.random.shuffle(indices)
+        split = int(np.floor(val_split * dataset_size))
+        val_indices = indices[:split]
+        train_indices = indices[split:]
+        
+        trainset = Subset(full_trainset, train_indices)
+        
+        val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        val_dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=val_transform)
+        val_subset = Subset(val_dataset, val_indices)
+        val_loader = DataLoader(val_subset, batch_size=config['batch_size'], shuffle=False)
+    else:
+        trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=train_transform)
+    
+    testset = datasets.CIFAR10(root="./data", train=False, download=True, transform=test_transform)
+    
+    train_loader = DataLoader(trainset, batch_size=config['batch_size'], shuffle=True)
+    test_loader = DataLoader(testset, batch_size=config['batch_size'], shuffle=False)
+    
+    # Create model
+    model = CrossModalModel(
+        base_model_name=MODEL_NAME,
+        embed_dim=EMBED_DIM,
+        num_classes=NUM_CLASSES,
+        in_channels=3,
+        full_finetune=full_finetune
+    ).to(DEVICE)
+    
+    # Update dropout
+    model.cls_head.dropout.p = config.get('dropout', 0.1)
+    
+    # Embedding alignment (Stage 2)
+    if do_alignment:
+        print("\n" + "="*60)
+        print("STAGE 2: Embedding Alignment")
+        print("="*60)
+        
+        # Load LLM for alignment
+        llm_model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
+        for param in llm_model.parameters():
+            param.requires_grad = False
+        
+        # Sample text embeddings
+        print("Sampling text embeddings for alignment...")
+        target_embeddings = sample_text_embeddings(llm_model, num_samples=NUM_SAMPLES_ALIGNMENT, device=DEVICE)
+        
+        # Alignment data loader (normalize but no augmentation - we want to match the distribution used in training)
+        align_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        align_dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=align_transform)
+        align_loader = DataLoader(align_dataset, batch_size=config.get('alignment_batch_size', 16), shuffle=True)
+        
+        # Distance metric
+        distance_metric_name = config.get('alignment_distance', 'mse')
+        if distance_metric_name == 'mse':
+            distance_metric = MSEDistance().to(DEVICE)
+        elif distance_metric_name == 'cosine':
+            distance_metric = CosineDistance().to(DEVICE)
+        elif distance_metric_name == 'mmd':
+            distance_metric = MMDDistance().to(DEVICE)
+        else:
+            distance_metric = MSEDistance().to(DEVICE)
+        
+        # Alignment optimizer (only for tokenizer and pos_embed)
+        align_params = list(model.tokenizer.parameters()) + [model.pos_embed]
+        align_optimizer = torch.optim.Adam(align_params, lr=config.get('alignment_lr', 1e-4))
+        
+        # Train alignment
+        alignment_epochs = config.get('alignment_epochs', 20)
+        for epoch in range(alignment_epochs):
+            loss = train_alignment_epoch(model, align_loader, target_embeddings, align_optimizer, distance_metric, DEVICE)
+            if (epoch + 1) % 5 == 0:
+                print(f"Alignment Epoch {epoch+1}/{alignment_epochs}: Loss = {loss:.6f}")
+        
+        print("Embedding alignment complete!")
+        del llm_model, target_embeddings  # Free memory
+    
+    # Task training (Stage 3)
+    print("\n" + "="*60)
+    print("STAGE 3: Task Training")
+    print("="*60)
+    
+    optimizer = create_optimizer(model, config)
+    scheduler = create_scheduler(optimizer, config, config.get('task_epochs', 50))
+    criterion = nn.CrossEntropyLoss()
+    
+    # MLflow setup
+    mlflow.set_tracking_uri("file:./mlruns")
+    model_short_name = MODEL_NAME.split("/")[-1].split("-")[0] if "/" in MODEL_NAME else MODEL_NAME
+    align_suffix = "_WithAlign" if do_alignment else "_Baseline"
+    finetune_suffix = "_FullFinetune" if full_finetune else "_FPT"
+    experiment_name = f"ORCA_{model_short_name}{align_suffix}{finetune_suffix}"
+    mlflow.set_experiment(experiment_name)
+    
+    # Training loop
+    task_epochs = config.get('task_epochs', 50)
+    best_val_acc = 0.0
+    
+    with mlflow.start_run():
+        # Log hyperparameters
+        mlflow.log_params({
+            'do_alignment': do_alignment,
+            'full_finetune': full_finetune,
+            **{f'hp_{k}': v for k, v in config.items()}
+        })
+        
+        for epoch in range(task_epochs):
+            train_loss, train_acc = train_task_epoch(model, train_loader, optimizer, criterion, DEVICE)
+            mlflow.log_metrics({
+                'train_loss': train_loss,
+                'train_acc': train_acc
+            }, step=epoch)
+            
+            # Evaluate on validation or test
+            if val_loader is not None:
+                val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
+                mlflow.log_metrics({
+                    'val_loss': val_loss,
+                    'val_acc': val_acc
+                }, step=epoch)
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                if (epoch + 1) % 5 == 0:
+                    print(f"Epoch {epoch+1}/{task_epochs}: Train Acc={train_acc:.4f}, Val Acc={val_acc:.4f}")
+            else:
+                test_loss, test_acc = evaluate(model, test_loader, criterion, DEVICE)
+                mlflow.log_metrics({
+                    'test_loss': test_loss,
+                    'test_acc': test_acc
+                }, step=epoch)
+                if (epoch + 1) % 5 == 0:
+                    print(f"Epoch {epoch+1}/{task_epochs}: Train Acc={train_acc:.4f}, Test Acc={test_acc:.4f}")
+            
+            if scheduler:
+                scheduler.step()
+                current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else None
+                if current_lr:
+                    mlflow.log_metric('learning_rate', current_lr, step=epoch)
+        
+        # Final evaluation and logging
+        if val_loader is not None:
+            final_loss, final_acc = evaluate(model, val_loader, criterion, DEVICE)
+            mlflow.log_metrics({
+                'final_val_loss': final_loss,
+                'final_val_acc': final_acc,
+                'best_val_acc': best_val_acc
+            })
+            if return_val_acc:
+                return final_acc, best_val_acc
+            return final_acc, None
+        else:
+            final_loss, final_acc = evaluate(model, test_loader, criterion, DEVICE)
+            mlflow.log_metrics({
+                'final_test_loss': final_loss,
+                'final_test_acc': final_acc
+            })
+            return final_acc, None
+
+
+# ===================== CLI Interface =====================
+def main():
+    parser = argparse.ArgumentParser(description='Unified ORCA Training')
+    parser.add_argument('--do_alignment', action='store_true',
+                       help='Perform embedding alignment (Stage 2)')
+    parser.add_argument('--full_finetune', action='store_true',
+                       help='Use full fine-tuning (vs FPT)')
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to JSON file with hyperparameters')
+    parser.add_argument('--val_split', type=float, default=0.0,
+                       help='Validation split ratio (0.0 = use test set)')
+    args = parser.parse_args()
+    
+    # Run training
+    final_acc, best_val_acc = train_orca(
+        do_alignment=args.do_alignment,
+        full_finetune=args.full_finetune,
+        config_path=args.config,
+        val_loader=None,
+        return_val_acc=(args.val_split > 0),
+        val_split=args.val_split
+    )
+    
+    print(f"\nFinal Accuracy: {final_acc:.4f}")
+    if best_val_acc is not None:
+        print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+
