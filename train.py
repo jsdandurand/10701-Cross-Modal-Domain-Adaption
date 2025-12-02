@@ -1,14 +1,3 @@
-"""
-Unified ORCA Training Script
-
-This script combines embedding alignment and task training into a single workflow.
-Supports:
-- Optional embedding alignment (Stage 2)
-- Task training (Stage 3)
-- Loading hyperparameters from JSON
-- FPT and full fine-tuning modes
-- Everything kept in memory (no intermediate saves)
-"""
 
 import torch
 import torch.nn as nn
@@ -20,19 +9,20 @@ import mlflow
 import os
 import argparse
 import json
+import tempfile
 from tqdm import tqdm
 from typing import Dict, Optional, Tuple
 import numpy as np
+from peft import LoraConfig, get_peft_model
 
-# ===================== Config =====================
+
 MODEL_NAME = "nickypro/tinyllama-110M"
 PATCH_SIZE = 4
 EMBED_DIM = AutoConfig.from_pretrained(MODEL_NAME).hidden_size
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 NUM_CLASSES = 10
-NUM_SAMPLES_ALIGNMENT = 50000  # Number of text samples for alignment
+NUM_SAMPLES_ALIGNMENT = 50000
 
-# ===================== Model Components =====================
 class ImageTokenizer(nn.Module):
     def __init__(self, patch_size=PATCH_SIZE, in_channels=3, embed_dim=EMBED_DIM):
         super().__init__()
@@ -60,19 +50,37 @@ class ClassificationHead(nn.Module):
 
 class CrossModalModel(nn.Module):
     def __init__(self, base_model_name=MODEL_NAME, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES, 
-                 in_channels=3, full_finetune=False):
+                 in_channels=3, finetune_mode='fpt', lora_rank=8, lora_alpha=16, lora_dropout=0.1):
         super().__init__()
         self.llm = AutoModel.from_pretrained(base_model_name)
+        self.finetune_mode = finetune_mode
         
-        if full_finetune:
+        if finetune_mode == 'full':
             for param in self.llm.parameters():
                 param.requires_grad = True
+            print("Full fine-tuning mode")
+        elif finetune_mode == 'lora':
+            for param in self.llm.parameters():
+                param.requires_grad = False
+            
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="FEATURE_EXTRACTION"
+            )
+            self.llm = get_peft_model(self.llm, lora_config)
+            trainable_params, total_params = self.llm.get_nb_trainable_parameters()
+            print(f"LoRA: rank={lora_rank}, alpha={lora_alpha}, trainable={trainable_params:,}/{total_params:,} ({100*trainable_params/total_params:.1f}%)")
         else:
             for param in self.llm.parameters():
                 param.requires_grad = False
             for name, param in self.llm.named_parameters():
                 if "norm" in name.lower():
                     param.requires_grad = True
+            print("FPT mode")
 
         self.tokenizer = ImageTokenizer(embed_dim=embed_dim, in_channels=in_channels)
         self.num_patches = (32 // PATCH_SIZE) ** 2
@@ -88,7 +96,6 @@ class CrossModalModel(nn.Module):
         return self.cls_head(pooled_hidden)
 
 
-# ===================== Distance Metrics for Alignment =====================
 class MSEDistance(nn.Module):
     def forward(self, x, y):
         if x.dim() == 3:
@@ -139,9 +146,7 @@ class MMDDistance(nn.Module):
         return xx.mean() + yy.mean() - 2 * xy.mean()
 
 
-# ===================== Helper Functions =====================
 def sample_text_embeddings(llm_model, num_samples=NUM_SAMPLES_ALIGNMENT, device=DEVICE):
-    """Sample text embeddings from LLM for alignment"""
     llm_model.eval()
     embed_layer = llm_model.get_input_embeddings()
     vocab_size = embed_layer.weight.size(0)
@@ -154,7 +159,6 @@ def sample_text_embeddings(llm_model, num_samples=NUM_SAMPLES_ALIGNMENT, device=
 
 
 def train_alignment_epoch(model, image_loader, target_embeddings, optimizer, distance_metric, device=DEVICE):
-    """Train one epoch for embedding alignment"""
     model.train()
     total_loss = 0
     num_batches = 0
@@ -180,7 +184,6 @@ def train_alignment_epoch(model, image_loader, target_embeddings, optimizer, dis
 
 
 def train_task_epoch(model, dataloader, optimizer, criterion, device=DEVICE):
-    """Train one epoch for task loss"""
     model.train()
     total_loss, total_correct, total_samples = 0, 0, 0
 
@@ -200,7 +203,6 @@ def train_task_epoch(model, dataloader, optimizer, criterion, device=DEVICE):
 
 
 def evaluate(model, dataloader, criterion, device=DEVICE):
-    """Evaluate model on task"""
     model.eval()
     total_loss, total_correct, total_samples = 0, 0, 0
 
@@ -220,40 +222,40 @@ def evaluate(model, dataloader, criterion, device=DEVICE):
 
 
 def load_hyperparameters(config_path: Optional[str]) -> Dict:
-    """Load hyperparameters from JSON file or return defaults"""
     if config_path and os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = json.load(f)
-        print(f"Loaded hyperparameters from {config_path}")
+        print(f"Loaded config from {config_path}")
         return config
     else:
-        # Default hyperparameters
         return {
-            'lr': 1e-3,
-            'batch_size': 64,
+            'lr': 5e-5,
+            'batch_size': 32,
             'weight_decay': 1e-4,
             'optimizer': 'adamw',
             'scheduler': 'cosine',
-            'dropout': 0.1,
+            'dropout': 0.2,
             'alignment_epochs': 20,
             'alignment_lr': 1e-4,
             'alignment_batch_size': 16,
             'alignment_distance': 'mse',
-            'task_epochs': 50
+            'task_epochs': 50,
+            'finetune_mode': 'fpt',
+            'lora_rank': 16,
+            'lora_alpha': 16,
+            'lora_dropout': 0.1
         }
 
 
 def create_optimizer(model, config: Dict):
-    """Create optimizer based on config"""
     params = filter(lambda p: p.requires_grad, model.parameters())
     if config['optimizer'] == 'adam':
         return torch.optim.Adam(params, lr=config['lr'], weight_decay=config['weight_decay'])
-    else:  # adamw
+    else:
         return torch.optim.AdamW(params, lr=config['lr'], weight_decay=config['weight_decay'])
 
 
 def create_scheduler(optimizer, config: Dict, num_epochs: int):
-    """Create learning rate scheduler based on config"""
     if config['scheduler'] == 'cosine':
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     elif config['scheduler'] == 'linear':
@@ -262,33 +264,20 @@ def create_scheduler(optimizer, config: Dict, num_epochs: int):
         return None
 
 
-# ===================== Main Training Function =====================
 def train_orca(
     do_alignment: bool = False,
-    full_finetune: bool = False,
+    finetune_mode: str = 'fpt',
     config_path: Optional[str] = None,
     val_loader: Optional[DataLoader] = None,
     return_val_acc: bool = False,
     val_split: float = 0.0
 ) -> Tuple[float, Optional[float]]:
-    """
-    Main training function for ORCA workflow
-    
-    Args:
-        do_alignment: Whether to perform embedding alignment
-        full_finetune: Whether to use full fine-tuning (vs FPT)
-        config_path: Path to JSON file with hyperparameters
-        val_loader: Validation loader (for hyperparameter tuning)
-        return_val_acc: Whether to return validation accuracy
-        val_split: Validation split ratio (if val_loader not provided)
-    
-    Returns:
-        Final test/val accuracy, and optionally validation accuracy
-    """
-    # Load hyperparameters
     config = load_hyperparameters(config_path)
+    config['finetune_mode'] = finetune_mode
     
-    # Data loading
+    if finetune_mode not in ['fpt', 'full', 'lora']:
+        raise ValueError(f"finetune_mode must be 'fpt', 'full', or 'lora', got '{finetune_mode}'")
+    
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomCrop(32, padding=4),
@@ -302,7 +291,6 @@ def train_orca(
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
     
-    # Handle validation split
     if val_loader is None and val_split > 0:
         from torch.utils.data import Subset
         full_trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=train_transform)
@@ -330,34 +318,37 @@ def train_orca(
     train_loader = DataLoader(trainset, batch_size=config['batch_size'], shuffle=True)
     test_loader = DataLoader(testset, batch_size=config['batch_size'], shuffle=False)
     
-    # Create model
+    lora_rank = config.get('lora_rank', 8)
+    lora_alpha = config.get('lora_alpha', 16)
+    lora_dropout = config.get('lora_dropout', 0.1)
+    
     model = CrossModalModel(
         base_model_name=MODEL_NAME,
         embed_dim=EMBED_DIM,
         num_classes=NUM_CLASSES,
         in_channels=3,
-        full_finetune=full_finetune
+        finetune_mode=finetune_mode,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout
     ).to(DEVICE)
     
-    # Update dropout
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable: {trainable_params:,}/{total_params:,} ({100*trainable_params/total_params:.1f}%)")
+    
     model.cls_head.dropout.p = config.get('dropout', 0.1)
     
-    # Embedding alignment (Stage 2)
     if do_alignment:
-        print("\n" + "="*60)
-        print("STAGE 2: Embedding Alignment")
-        print("="*60)
+        print("\nAlignment stage")
         
-        # Load LLM for alignment
         llm_model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
         for param in llm_model.parameters():
             param.requires_grad = False
         
-        # Sample text embeddings
-        print("Sampling text embeddings for alignment...")
+        print("Sampling text embeddings...")
         target_embeddings = sample_text_embeddings(llm_model, num_samples=NUM_SAMPLES_ALIGNMENT, device=DEVICE)
         
-        # Alignment data loader (normalize but no augmentation - we want to match the distribution used in training)
         align_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
@@ -365,7 +356,6 @@ def train_orca(
         align_dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=align_transform)
         align_loader = DataLoader(align_dataset, batch_size=config.get('alignment_batch_size', 16), shuffle=True)
         
-        # Distance metric
         distance_metric_name = config.get('alignment_distance', 'mse')
         if distance_metric_name == 'mse':
             distance_metric = MSEDistance().to(DEVICE)
@@ -376,57 +366,54 @@ def train_orca(
         else:
             distance_metric = MSEDistance().to(DEVICE)
         
-        # Alignment optimizer (only for tokenizer and pos_embed)
         align_params = list(model.tokenizer.parameters()) + [model.pos_embed]
         align_optimizer = torch.optim.Adam(align_params, lr=config.get('alignment_lr', 1e-4))
         
-        # Train alignment
         alignment_epochs = config.get('alignment_epochs', 20)
         for epoch in range(alignment_epochs):
             loss = train_alignment_epoch(model, align_loader, target_embeddings, align_optimizer, distance_metric, DEVICE)
             if (epoch + 1) % 5 == 0:
-                print(f"Alignment Epoch {epoch+1}/{alignment_epochs}: Loss = {loss:.6f}")
+                print(f"Align epoch {epoch+1}/{alignment_epochs}: loss={loss:.6f}")
         
-        print("Embedding alignment complete!")
-        del llm_model, target_embeddings  # Free memory
+        print("Alignment done")
+        del llm_model, target_embeddings
     
-    # Task training (Stage 3)
-    print("\n" + "="*60)
-    print("STAGE 3: Task Training")
-    print("="*60)
+    print("\nTask training")
     
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config, config.get('task_epochs', 50))
     criterion = nn.CrossEntropyLoss()
     
-    # MLflow setup
     mlflow.set_tracking_uri("file:./mlruns")
     model_short_name = MODEL_NAME.split("/")[-1].split("-")[0] if "/" in MODEL_NAME else MODEL_NAME
     align_suffix = "_WithAlign" if do_alignment else "_Baseline"
-    finetune_suffix = "_FullFinetune" if full_finetune else "_FPT"
+    if finetune_mode == 'full':
+        finetune_suffix = "_FullFinetune"
+    elif finetune_mode == 'lora':
+        finetune_suffix = f"_LoRA_r{lora_rank}"
+    else:
+        finetune_suffix = "_FPT"
     experiment_name = f"ORCA_{model_short_name}{align_suffix}{finetune_suffix}"
     mlflow.set_experiment(experiment_name)
     
-    # Training loop
     task_epochs = config.get('task_epochs', 50)
     best_val_acc = 0.0
     
     with mlflow.start_run():
-        # Log hyperparameters
         mlflow.log_params({
             'do_alignment': do_alignment,
-            'full_finetune': full_finetune,
+            'finetune_mode': finetune_mode,
             **{f'hp_{k}': v for k, v in config.items()}
         })
         
-        for epoch in range(task_epochs):
+        epoch_pbar = tqdm(range(task_epochs), desc="Training", unit="epoch")
+        for epoch in epoch_pbar:
             train_loss, train_acc = train_task_epoch(model, train_loader, optimizer, criterion, DEVICE)
             mlflow.log_metrics({
                 'train_loss': train_loss,
                 'train_acc': train_acc
             }, step=epoch)
             
-            # Evaluate on validation or test
             if val_loader is not None:
                 val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
                 mlflow.log_metrics({
@@ -435,16 +422,21 @@ def train_orca(
                 }, step=epoch)
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
-                if (epoch + 1) % 5 == 0:
-                    print(f"Epoch {epoch+1}/{task_epochs}: Train Acc={train_acc:.4f}, Val Acc={val_acc:.4f}")
+                epoch_pbar.set_postfix({
+                    'train_acc': f'{train_acc:.4f}',
+                    'val_acc': f'{val_acc:.4f}',
+                    'best_val': f'{best_val_acc:.4f}'
+                })
             else:
                 test_loss, test_acc = evaluate(model, test_loader, criterion, DEVICE)
                 mlflow.log_metrics({
                     'test_loss': test_loss,
                     'test_acc': test_acc
                 }, step=epoch)
-                if (epoch + 1) % 5 == 0:
-                    print(f"Epoch {epoch+1}/{task_epochs}: Train Acc={train_acc:.4f}, Test Acc={test_acc:.4f}")
+                epoch_pbar.set_postfix({
+                    'train_acc': f'{train_acc:.4f}',
+                    'test_acc': f'{test_acc:.4f}'
+                })
             
             if scheduler:
                 scheduler.step()
@@ -452,7 +444,8 @@ def train_orca(
                 if current_lr:
                     mlflow.log_metric('learning_rate', current_lr, step=epoch)
         
-        # Final evaluation and logging
+        epoch_pbar.close()
+        
         if val_loader is not None:
             final_loss, final_acc = evaluate(model, val_loader, criterion, DEVICE)
             mlflow.log_metrics({
@@ -472,32 +465,64 @@ def train_orca(
             return final_acc, None
 
 
-# ===================== CLI Interface =====================
 def main():
     parser = argparse.ArgumentParser(description='Unified ORCA Training')
     parser.add_argument('--do_alignment', action='store_true',
                        help='Perform embedding alignment (Stage 2)')
-    parser.add_argument('--full_finetune', action='store_true',
-                       help='Use full fine-tuning (vs FPT)')
+    parser.add_argument('--finetune_mode', type=str, default='lora',
+                       choices=['fpt', 'full', 'lora'],
+                       help='Fine-tuning mode: fpt (frozen backbone + layer norms), full (all params), or lora (LoRA adapters)')
+    parser.add_argument('--lora_rank', type=int, default=None,
+                       help='LoRA rank (only used if finetune_mode=lora). Default: 8')
+    parser.add_argument('--lora_alpha', type=int, default=None,
+                       help='LoRA alpha scaling factor (only used if finetune_mode=lora). Default: 16')
+    parser.add_argument('--lora_dropout', type=float, default=None,
+                       help='LoRA dropout rate (only used if finetune_mode=lora). Default: 0.1')
     parser.add_argument('--config', type=str, default=None,
                        help='Path to JSON file with hyperparameters')
     parser.add_argument('--val_split', type=float, default=0.0,
                        help='Validation split ratio (0.0 = use test set)')
     args = parser.parse_args()
     
-    # Run training
+    finetune_mode = args.finetune_mode
+    config_overrides = {}
+    if args.lora_rank is not None:
+        config_overrides['lora_rank'] = args.lora_rank
+    if args.lora_alpha is not None:
+        config_overrides['lora_alpha'] = args.lora_alpha
+    if args.lora_dropout is not None:
+        config_overrides['lora_dropout'] = args.lora_dropout
+    
+    config_path = args.config
+    temp_config_path = None
+    if config_overrides:
+        if args.config and os.path.exists(args.config):
+            with open(args.config, 'r') as f:
+                config = json.load(f)
+        else:
+            config = load_hyperparameters(None)
+        config.update(config_overrides)
+        temp_config = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(config, temp_config, indent=2)
+        temp_config.close()
+        temp_config_path = temp_config.name
+        config_path = temp_config_path
+    
     final_acc, best_val_acc = train_orca(
         do_alignment=args.do_alignment,
-        full_finetune=args.full_finetune,
-        config_path=args.config,
+        finetune_mode=finetune_mode,
+        config_path=config_path,
         val_loader=None,
         return_val_acc=(args.val_split > 0),
         val_split=args.val_split
     )
     
-    print(f"\nFinal Accuracy: {final_acc:.4f}")
+    print(f"\nFinal accuracy: {final_acc:.4f}")
     if best_val_acc is not None:
-        print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+        print(f"Best val accuracy: {best_val_acc:.4f}")
+    
+    if temp_config_path and os.path.exists(temp_config_path):
+        os.unlink(temp_config_path)
 
 
 if __name__ == "__main__":
