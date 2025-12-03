@@ -39,26 +39,70 @@ echo "Environment setup complete."
 echo "=========================================="
 
 # ============================================
-# RUN THE 3-STAGE PIPELINE
+# PREVIOUS 3-STAGE PIPELINE (COMMENTED OUT)
 # ============================================
 
-# Stage 1: Baseline (no pretrained tokenizer)
-echo "Stage 1: Training baseline..."
-python -u train_tinyllama.py
-echo "Stage 1 complete."
-echo "=========================================="
+# # Stage 1: Baseline (no pretrained tokenizer)
+# echo "Stage 1: Training baseline..."
+# python -u train_tinyllama.py
+# echo "Stage 1 complete."
+# echo "=========================================="
 
-# Stage 2: Embedding Alignment
-echo "Stage 2: Training embedding alignment..."
-python -u train_stage2_align.py --distance mmd
-echo "Stage 2 complete."
-echo "=========================================="
+# # Stage 2: Embedding Alignment
+# echo "Stage 2: Training embedding alignment..."
+# python -u train_stage2_align.py --distance mmd
+# echo "Stage 2 complete."
+# echo "=========================================="
 
-# Stage 3: With aligned tokenizer
-echo "Stage 3: Training with aligned tokenizer..."
-rm -f latest_checkpoint.pt
-python -u train_tinyllama.py --pretrained stage2_align_mse_model.pt
-echo "Stage 3 complete."
+# # Stage 3: With aligned tokenizer
+# echo "Stage 3: Training with aligned tokenizer..."
+# rm -f latest_checkpoint.pt
+# python -u train_tinyllama.py --pretrained stage2_align_mse_model.pt
+# echo "Stage 3 complete."
+# echo "=========================================="
+
+# ============================================
+# ASHA HYPERPARAMETER TUNING FOR ALL CONFIGS
+# ============================================
+
+# 1. FPT + Alignment
+echo "=========================================="
+echo "HP Tuning: FPT + Alignment"
+echo "=========================================="
+python -u tune_hp.py --do_alignment --finetune_mode fpt
+mv best_hyperparameters.json best_hp_fpt_align.json 2>/dev/null || true
+mv best_hyperparameters_summary.json best_hp_fpt_align_summary.json 2>/dev/null || true
+echo "FPT + Alignment HP tuning complete."
+
+# 2. LoRA + Alignment
+echo "=========================================="
+echo "HP Tuning: LoRA + Alignment"
+echo "=========================================="
+python -u tune_hp.py --do_alignment --finetune_mode lora
+mv best_hyperparameters.json best_hp_lora_align.json 2>/dev/null || true
+mv best_hyperparameters_summary.json best_hp_lora_align_summary.json 2>/dev/null || true
+echo "LoRA + Alignment HP tuning complete."
+
+# 3. Full Finetune + Alignment
+echo "=========================================="
+echo "HP Tuning: Full Finetune + Alignment"
+echo "=========================================="
+python -u tune_hp.py --do_alignment --finetune_mode full
+mv best_hyperparameters.json best_hp_full_align.json 2>/dev/null || true
+mv best_hyperparameters_summary.json best_hp_full_align_summary.json 2>/dev/null || true
+echo "Full Finetune + Alignment HP tuning complete."
+
+# 4. Full Finetune (No Alignment)
+echo "=========================================="
+echo "HP Tuning: Full Finetune (No Alignment)"
+echo "=========================================="
+python -u tune_hp.py --finetune_mode full
+mv best_hyperparameters.json best_hp_full_noalign.json 2>/dev/null || true
+mv best_hyperparameters_summary.json best_hp_full_noalign_summary.json 2>/dev/null || true
+echo "Full Finetune (No Alignment) HP tuning complete."
+
+echo "=========================================="
+echo "All HP tuning runs complete!"
 echo "=========================================="
 
 echo "Job finished at $(date)"
