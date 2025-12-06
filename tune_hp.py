@@ -247,8 +247,8 @@ def main():
     parser.add_argument('--alignment_epochs', type=int, default=15,
                        help='Fixed number of alignment epochs (not tuned)')
     parser.add_argument('--alignment_distance', type=str, default='mse',
-                       choices=['mse', 'mmd', 'otdd'],
-                       help='Options: mse, mmd, otdd')
+                       choices=['mse', 'mmd'],
+                       help='Options: mse, mmd')
     args = parser.parse_args()
     
     finetune_mode = args.finetune_mode

@@ -16,7 +16,7 @@ from peft import LoraConfig, get_peft_model
 
 from utils import (
     load_hyperparameters, create_optimizer, create_scheduler,
-    sample_text_embeddings, MSEDistance, MMDDistance, OTDDDistance
+    sample_text_embeddings, MSEDistance, MMDDistance
 )
 
 
@@ -104,29 +104,24 @@ class CrossModalModel(nn.Module):
         return self.cls_head(pooled_hidden)
 
 
-def train_alignment_epoch(model, image_loader, target_embeddings, target_labels, optimizer, distance_metric, device=DEVICE, use_otdd=False):
+def train_alignment_epoch(model, image_loader, target_embeddings, optimizer, distance_metric, device=DEVICE):
     model.train()
     total_loss = 0
     num_batches = 0
     
     for images, image_labels in image_loader:
         images = images.to(device)
-        image_labels = image_labels.to(device)
         batch_size = images.size(0)
         
         # randomly sample matching text embeddings
         indices = torch.randint(0, target_embeddings.size(0), (batch_size,), device=device)
         target_embeds = target_embeddings[indices].to(device)
-        target_labels_batch = target_labels[indices].to(device)
         
         optimizer.zero_grad()
         image_embeds = model.tokenizer(images)
         image_embeds = image_embeds + model.pos_embed
         
-        if use_otdd:
-            loss = distance_metric(image_embeds, target_embeds, image_labels, target_labels_batch)
-        else:
-            loss = distance_metric(image_embeds, target_embeds)
+        loss = distance_metric(image_embeds, target_embeds)
         
         loss.backward()
         optimizer.step()
@@ -293,15 +288,12 @@ def train_orca(
         align_loader = DataLoader(align_dataset, batch_size=config.get('alignment_batch_size', 16), shuffle=True)
         
         distance_metric_name = config.get('alignment_distance', 'mse')
-        use_otdd = (distance_metric_name == 'otdd')
         
         # TODO: maybe try combining multiple distance metrics?
         if distance_metric_name == 'mse':
             distance_metric = MSEDistance().to(DEVICE)
         elif distance_metric_name == 'mmd':
             distance_metric = MMDDistance().to(DEVICE)
-        elif distance_metric_name == 'otdd':
-            distance_metric = OTDDDistance(num_classes=NUM_CLASSES).to(DEVICE)
         else:
             distance_metric = MSEDistance().to(DEVICE)  # fallback to mse
         
@@ -310,7 +302,7 @@ def train_orca(
         
         alignment_epochs = config.get('alignment_epochs', 20)
         for epoch in range(alignment_epochs):
-            loss = train_alignment_epoch(model, align_loader, target_embeddings, target_labels, align_optimizer, distance_metric, DEVICE, use_otdd=use_otdd)
+            loss = train_alignment_epoch(model, align_loader, target_embeddings, align_optimizer, distance_metric, DEVICE)
             if (epoch + 1) % 5 == 0:
                 print(f"Align epoch {epoch+1}/{alignment_epochs}: loss={loss:.6f}")
         
