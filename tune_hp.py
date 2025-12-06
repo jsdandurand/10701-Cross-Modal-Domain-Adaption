@@ -29,9 +29,9 @@ def get_hyperparameter_space(finetune_mode: str = 'fpt') -> Dict:
     if finetune_mode == 'full':
         return {
             'lr': [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
-            'batch_size': [16, 32, 64],
+            'batch_size': [16, 32, 64, 128],
             'weight_decay': [0, 1e-4, 1e-2],
-            'optimizer': ['adamw'],
+            'optimizer': ['adam', 'adamw'],
             'scheduler': ['cosine', 'linear'],
             'dropout': [0.0, 0.1, 0.2],
             'alignment_lr': [1e-5, 1e-4, 5e-4],
@@ -40,23 +40,23 @@ def get_hyperparameter_space(finetune_mode: str = 'fpt') -> Dict:
         }
     elif finetune_mode == 'lora':
         return {
-            'lr': [5e-5, 1e-4, 5e-4, 1e-3],
-            'batch_size': [32, 64, 128],
+            'lr': [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+            'batch_size': [16, 32, 64, 128],
             'weight_decay': [0, 1e-4, 1e-2],
-            'optimizer': ['adamw'],
-            'scheduler': ['cosine'],
-            'dropout': [0.1, 0.2],
+            'optimizer': ['adam', 'adamw'],
+            'scheduler': ['cosine', 'linear'],
+            'dropout': [0, 0.1, 0.2],
             'alignment_lr': [1e-5, 1e-4, 5e-4],
             'alignment_batch_size': [8, 16, 32],
-            'lora_rank': [8, 16, 32],
+            'lora_rank': [4, 8, 16, 32],
             'lora_alpha': [8, 16, 32, 64],
-            'lora_dropout': [0.0, 0.05, 0.1, 0.2],
+            'lora_dropout': [0.0, 0.1, 0.2],
             'max_grad_norm': [1.0]
         }
     else:
         return {
             'lr': [1e-4, 5e-4, 1e-3, 5e-3],
-            'batch_size': [32, 64, 128],
+            'batch_size': [16, 32, 64, 128],
             'weight_decay': [0, 1e-4, 1e-2],
             'optimizer': ['adam', 'adamw'],
             'scheduler': ['cosine', 'linear'],
