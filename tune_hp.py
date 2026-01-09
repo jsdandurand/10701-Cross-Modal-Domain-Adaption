@@ -18,10 +18,10 @@ from train import train_orca, load_hyperparameters, DEVICE
 RANDOM_SEED = 42
 VAL_SPLIT = 0.2
 
-MAX_RUNG = 4
+MAX_RUNG = 3
 MIN_RUNG = 0
 REDUCTION_FACTOR = 2
-MAX_TRIALS = 50
+MAX_TRIALS = 20
 
 
 def get_hyperparameter_space(finetune_mode: str = 'fpt') -> Dict:

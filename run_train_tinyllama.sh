@@ -62,47 +62,69 @@ echo "=========================================="
 # echo "=========================================="
 
 # ============================================
-# ASHA HYPERPARAMETER TUNING FOR ALL CONFIGS
+# FINAL 50-EPOCH TRAINING RUNS
+# Using optimal hyperparameters from ASHA tuning
 # ============================================
 
-# 1. FPT + Alignment
+# Alternative Experiment
 echo "=========================================="
-echo "HP Tuning: FPT + Alignment"
+echo "Final Training: LoRA NOALIGN (50 epochs)"
 echo "=========================================="
-python -u tune_hp.py --do_alignment --finetune_mode fpt
-mv best_hyperparameters.json best_hp_fpt_align.json 2>/dev/null || true
-mv best_hyperparameters_summary.json best_hp_fpt_align_summary.json 2>/dev/null || true
-echo "FPT + Alignment HP tuning complete."
-
-# 2. LoRA + Alignment
-echo "=========================================="
-echo "HP Tuning: LoRA + Alignment"
-echo "=========================================="
-python -u tune_hp.py --do_alignment --finetune_mode lora
-mv best_hyperparameters.json best_hp_lora_align.json 2>/dev/null || true
-mv best_hyperparameters_summary.json best_hp_lora_align_summary.json 2>/dev/null || true
-echo "LoRA + Alignment HP tuning complete."
-
-# 3. Full Finetune + Alignment
-echo "=========================================="
-echo "HP Tuning: Full Finetune + Alignment"
-echo "=========================================="
-python -u tune_hp.py --do_alignment --finetune_mode full
-mv best_hyperparameters.json best_hp_full_align.json 2>/dev/null || true
-mv best_hyperparameters_summary.json best_hp_full_align_summary.json 2>/dev/null || true
-echo "Full Finetune + Alignment HP tuning complete."
-
-# 4. Full Finetune (No Alignment)
-echo "=========================================="
-echo "HP Tuning: Full Finetune (No Alignment)"
-echo "=========================================="
-python -u tune_hp.py --finetune_mode full
-mv best_hyperparameters.json best_hp_full_noalign.json 2>/dev/null || true
-mv best_hyperparameters_summary.json best_hp_full_noalign_summary.json 2>/dev/null || true
-echo "Full Finetune (No Alignment) HP tuning complete."
+START_TIME=$(date +%s)
+python -u train.py --finetune_mode lora --config final_lora_noalign.json
+END_TIME=$(date +%s)
+echo "LoRA+Align Runtime: $((END_TIME - START_TIME)) seconds"
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 
 echo "=========================================="
-echo "All HP tuning runs complete!"
+echo "Final Training: FPT NOALIGN (50 epochs)"
 echo "=========================================="
+START_TIME=$(date +%s)
+python -u train.py --do_alignment --finetune_mode fpt --config final_fpt_align.json
+END_TIME=$(date +%s)
+echo "FPT+Align Runtime: $((END_TIME - START_TIME)) seconds"
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 
-echo "Job finished at $(date)"
+# # --- CONFIG 1: FPT + Alignment ---
+# echo "=========================================="
+# echo "Final Training: FPT + Alignment (50 epochs)"
+# echo "=========================================="
+# START_TIME=$(date +%s)
+# python -u train.py --do_alignment --finetune_mode fpt --config final_fpt_align.json
+# END_TIME=$(date +%s)
+# echo "FPT+Align Runtime: $((END_TIME - START_TIME)) seconds"
+# nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+# # --- CONFIG 2: LoRA + Alignment ---
+# echo "=========================================="
+# echo "Final Training: LoRA + Alignment (50 epochs)"
+# echo "=========================================="
+# START_TIME=$(date +%s)
+# python -u train.py --do_alignment --finetune_mode lora --config final_lora_align.json
+# END_TIME=$(date +%s)
+# echo "LoRA+Align Runtime: $((END_TIME - START_TIME)) seconds"
+# nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+# # --- CONFIG 3: Full Finetune + Alignment ---
+# echo "=========================================="
+# echo "Final Training: Full Finetune + Alignment (50 epochs)"
+# echo "=========================================="
+# START_TIME=$(date +%s)
+# python -u train.py --do_alignment --finetune_mode full --config final_full_align.json
+# END_TIME=$(date +%s)
+# echo "Full+Align Runtime: $((END_TIME - START_TIME)) seconds"
+# nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+# # --- CONFIG 4: Full Finetune (No Alignment) ---
+# echo "=========================================="
+# echo "Final Training: Full Finetune - No Alignment (50 epochs)"
+# echo "=========================================="
+# START_TIME=$(date +%s)
+# python -u train.py --finetune_mode full --config final_full_noalign.json
+# END_TIME=$(date +%s)
+# echo "Full(NoAlign) Runtime: $((END_TIME - START_TIME)) seconds"
+# nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+# echo "All final training runs complete!"
+
+# echo "Job finished at $(date)"
