@@ -2,11 +2,13 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 
+**Report:** [10701 Final Project Report (PDF)](report/10701__Final_Project_Report.pdf)
+
 TL;DR: Cross-modal domain adaptation by aligning image patch embeddings with TinyLlama token embeddings; evaluated on CIFAR-10.
 
 Key result: Full fine-tuning + MMD alignment reached 87.39% test accuracy on CIFAR-10.
 
-Links: [Report PDF](10701__Final_Project_Report.pdf) | [Reproduce](#reproduce-full-runs) | [Code structure](#project-structure)
+Links: [Reproduce](#reproduce-full-runs) | [Code structure](#project-structure)
 
 ## Key Results (Test Accuracy)
 
