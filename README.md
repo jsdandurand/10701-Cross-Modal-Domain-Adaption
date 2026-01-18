@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 
-**Report:** [10701 Final Project Report (PDF)](report/10701__Final_Project_Report.pdf)
+### **Report:** [10-701 Final Project Report (PDF)](report/10701__Final_Project_Report.pdf)
 
 TL;DR: Cross-modal domain adaptation by aligning image patch embeddings with TinyLlama token embeddings; evaluated on CIFAR-10.
 
